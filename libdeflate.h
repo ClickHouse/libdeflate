@@ -87,6 +87,23 @@ libdeflate_deflate_compress(struct libdeflate_compressor *compressor,
 			    void *out, size_t out_nbytes_avail);
 
 /*
+ * libdeflate_deflate_compress_stream_chunk() compresses one chunk of a DEFLATE
+ * stream WITHOUT terminating it. All emitted blocks are non-final and the output
+ * ends on a byte boundary (via an empty stored "sync flush" block), so the
+ * outputs of consecutive calls can be concatenated. After the last chunk, append
+ * a final block (e.g. the two bytes 0x03 0x00, an empty final block) to terminate
+ * the stream. This is a ClickHouse addition that lets libdeflate back a streaming
+ * compressor while still producing a single valid DEFLATE/gzip/zlib member.
+ *
+ * Returns the number of bytes written, or 0 if 'out_nbytes_avail' was too small;
+ * size 'libdeflate_deflate_compress_bound(in_nbytes) + 8' to be safe.
+ */
+LIBDEFLATEAPI size_t
+libdeflate_deflate_compress_stream_chunk(struct libdeflate_compressor *compressor,
+					 const void *in, size_t in_nbytes,
+					 void *out, size_t out_nbytes_avail);
+
+/*
  * libdeflate_deflate_compress_bound() returns a worst-case upper bound on the
  * number of bytes of compressed data that may be produced by compressing any
  * buffer of length less than or equal to 'in_nbytes' using
