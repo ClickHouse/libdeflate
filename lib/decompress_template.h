@@ -69,9 +69,36 @@ FUNCNAME(struct libdeflate_decompressor * restrict d,
 	bitbuf_t litlen_tablemask;
 	u32 entry;
 
+#ifdef DEFLATE_STREAMING
+	/*
+	 * Streaming state. 'window_nbytes' bytes of previously produced output
+	 * precede 'out' (for resolving back-references). The checkpoint (cp_*)
+	 * holds the byte-aligned resume state at the last block boundary; on
+	 * suspension we roll back to it.
+	 */
+	const size_t window_nbytes = d->window_nbytes;
+	const u8 *cp_in_next = in_next;
+	u8 *cp_out_next = out_next;
+	bitbuf_t cp_bitbuf = d->saved_bitbuf;
+	u32 cp_bitsleft = d->saved_bitsleft;
+
+	bitbuf = d->saved_bitbuf;
+	bitsleft = d->saved_bitsleft;
+#endif
+
 next_block:
 	/* Starting to read the next block */
 	;
+#ifdef DEFLATE_STREAMING
+	/* Checkpoint the byte-aligned resume state at this block boundary. */
+	{
+		u32 cp_bl = (u8)bitsleft;
+		cp_in_next = in_next - ((cp_bl >> 3) - overread_count);
+		cp_out_next = out_next;
+		cp_bitsleft = cp_bl & 7;
+		cp_bitbuf = bitbuf & (((bitbuf_t)1 << cp_bitsleft) - 1);
+	}
+#endif
 
 	STATIC_ASSERT(CAN_CONSUME(1 + 2 + 5 + 5 + 4 + 3));
 	REFILL_BITS();
@@ -268,15 +295,35 @@ next_block:
 		bitbuf = 0;
 		bitsleft = 0;
 
+#ifdef DEFLATE_STREAMING
+		if (in_end - in_next < 4) {
+			if (!d->end_of_input)
+				goto need_more_input;
+			SAFETY_CHECK(0);
+		}
+#else
 		SAFETY_CHECK(in_end - in_next >= 4);
+#endif
 		len = get_unaligned_le16(in_next);
 		nlen = get_unaligned_le16(in_next + 2);
 		in_next += 4;
 
 		SAFETY_CHECK(len == (u16)~nlen);
 		if (unlikely(len > out_end - out_next))
+#ifdef DEFLATE_STREAMING
+			goto need_more_output;
+#else
 			return LIBDEFLATE_INSUFFICIENT_SPACE;
+#endif
+#ifdef DEFLATE_STREAMING
+		if ((size_t)(in_end - in_next) < len) {
+			if (!d->end_of_input)
+				goto need_more_input;
+			SAFETY_CHECK(0);
+		}
+#else
 		SAFETY_CHECK(len <= in_end - in_next);
+#endif
 
 		memcpy(out_next, in_next, len);
 		in_next += len;
@@ -547,7 +594,11 @@ have_decode_tables:
 		offset += EXTRACT_VARBITS8(saved_bitbuf, entry) >> (u8)(entry >> 8);
 
 		/* Validate the match offset; needed even in the fastloop. */
+#ifdef DEFLATE_STREAMING
+		SAFETY_CHECK((size_t)offset <= (size_t)(out_next - (u8 *)out) + window_nbytes);
+#else
 		SAFETY_CHECK(offset <= out_next - (const u8 *)out);
+#endif
 		src = out_next - offset;
 		dst = out_next;
 		out_next += length;
@@ -698,7 +749,11 @@ generic_loop:
 		length = entry >> 16;
 		if (entry & HUFFDEC_LITERAL) {
 			if (unlikely(out_next == out_end))
+#ifdef DEFLATE_STREAMING
+				goto need_more_output;
+#else
 				return LIBDEFLATE_INSUFFICIENT_SPACE;
+#endif
 			*out_next++ = length;
 			continue;
 		}
@@ -706,7 +761,11 @@ generic_loop:
 			goto block_done;
 		length += EXTRACT_VARBITS8(saved_bitbuf, entry) >> (u8)(entry >> 8);
 		if (unlikely(length > out_end - out_next))
+#ifdef DEFLATE_STREAMING
+			goto need_more_output;
+#else
 			return LIBDEFLATE_INSUFFICIENT_SPACE;
+#endif
 
 		if (!CAN_CONSUME(LENGTH_MAXBITS + OFFSET_MAXBITS))
 			REFILL_BITS();
@@ -724,7 +783,11 @@ generic_loop:
 		bitbuf >>= (u8)entry;
 		bitsleft -= entry;
 
+#ifdef DEFLATE_STREAMING
+		SAFETY_CHECK((size_t)offset <= (size_t)(out_next - (u8 *)out) + window_nbytes);
+#else
 		SAFETY_CHECK(offset <= out_next - (const u8 *)out);
+#endif
 		src = out_next - offset;
 		dst = out_next;
 		out_next += length;
@@ -769,6 +832,26 @@ block_done:
 			return LIBDEFLATE_SHORT_OUTPUT;
 	}
 	return LIBDEFLATE_SUCCESS;
+
+#ifdef DEFLATE_STREAMING
+	/*
+	 * Suspension points: roll back to the last block boundary checkpoint and
+	 * report how much input/output was fully consumed/produced up to it.
+	 */
+need_more_input:
+	d->saved_bitbuf = cp_bitbuf;
+	d->saved_bitsleft = cp_bitsleft;
+	*actual_in_nbytes_ret = cp_in_next - (const u8 *)in;
+	*actual_out_nbytes_ret = cp_out_next - (u8 *)out;
+	return LIBDEFLATE_STREAM_NEED_INPUT;
+
+need_more_output:
+	d->saved_bitbuf = cp_bitbuf;
+	d->saved_bitsleft = cp_bitsleft;
+	*actual_in_nbytes_ret = cp_in_next - (const u8 *)in;
+	*actual_out_nbytes_ret = cp_out_next - (u8 *)out;
+	return LIBDEFLATE_STREAM_NEED_OUTPUT;
+#endif
 }
 
 #undef FUNCNAME

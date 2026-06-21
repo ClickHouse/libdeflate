@@ -244,6 +244,7 @@ do {									\
 				bitbuf |= (bitbuf_t)*in_next++ <<	\
 					  (u8)bitsleft;			\
 			} else {					\
+				OVERREAD_HANDLER();			\
 				overread_count++;			\
 				SAFETY_CHECK(overread_count <=		\
 					     sizeof(bitbuf_t));		\
@@ -252,6 +253,15 @@ do {									\
 		}							\
 	}								\
 } while (0)
+
+/*
+ * Hook invoked by REFILL_BITS() when it would overread the input. It is a no-op
+ * for the normal (one-shot) decompressor, and is redefined to suspend at a block
+ * boundary for the streaming instantiation of the template.
+ */
+#ifndef OVERREAD_HANDLER
+#  define OVERREAD_HANDLER()	/* nothing */
+#endif
 
 /*
  * REFILL_BITS_IN_FASTLOOP() is like REFILL_BITS(), but it doesn't check for the
@@ -672,6 +682,16 @@ struct libdeflate_decompressor {
 	bool static_codes_loaded;
 	unsigned litlen_tablebits;
 
+	/*
+	 * Streaming decompression state (libdeflate_deflate_decompress_stream()).
+	 * Used only by the DEFLATE_STREAMING instantiation of the decode template;
+	 * the normal one-shot path never touches these.
+	 */
+	bool end_of_input;
+	size_t window_nbytes;
+	bitbuf_t saved_bitbuf;
+	u32 saved_bitsleft;
+
 	/* The free() function for this struct, chosen at allocation time */
 	free_func_t free_func;
 };
@@ -1081,6 +1101,21 @@ typedef enum libdeflate_result (*decompress_func_t)
 #undef EXTRACT_VARBITS8
 #include "decompress_template.h"
 
+/*
+ * Streaming instantiation: same decoder, but suspends at block boundaries (see
+ * libdeflate_deflate_decompress_stream()). DEFLATE_STREAMING enables the
+ * streaming-only code paths in the template, and OVERREAD_HANDLER() turns an
+ * input-overread into a clean suspension.
+ */
+#define FUNCNAME deflate_decompress_stream_impl
+#define DEFLATE_STREAMING 1
+#undef OVERREAD_HANDLER
+#define OVERREAD_HANDLER()	do { if (!d->end_of_input) goto need_more_input; } while (0)
+#include "decompress_template.h"
+#undef DEFLATE_STREAMING
+#undef OVERREAD_HANDLER
+#define OVERREAD_HANDLER()	/* nothing */
+
 /* Include architecture-specific implementation(s) if available. */
 #undef DEFAULT_IMPL
 #undef arch_select_decompress_func
@@ -1150,6 +1185,34 @@ libdeflate_deflate_decompress(struct libdeflate_decompressor *d,
 	return libdeflate_deflate_decompress_ex(d, in, in_nbytes,
 						out, out_nbytes_avail,
 						NULL, actual_out_nbytes_ret);
+}
+
+LIBDEFLATEAPI void
+libdeflate_deflate_decompress_stream_reset(struct libdeflate_decompressor *d)
+{
+	d->end_of_input = false;
+	d->window_nbytes = 0;
+	d->saved_bitbuf = 0;
+	d->saved_bitsleft = 0;
+	d->static_codes_loaded = false;
+}
+
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_stream(struct libdeflate_decompressor *d,
+				     int end_of_input,
+				     const void *in, size_t in_nbytes,
+				     void *out, size_t out_nbytes_avail,
+				     size_t window_nbytes,
+				     size_t *actual_in_nbytes_ret,
+				     size_t *actual_out_nbytes_ret)
+{
+	d->end_of_input = (end_of_input != 0);
+	d->window_nbytes = window_nbytes;
+	/* Streaming uses the generic instantiation (no arch dispatch needed). */
+	return deflate_decompress_stream_impl(d, in, in_nbytes,
+					      out, out_nbytes_avail,
+					      actual_in_nbytes_ret,
+					      actual_out_nbytes_ret);
 }
 
 LIBDEFLATEAPI struct libdeflate_decompressor *
