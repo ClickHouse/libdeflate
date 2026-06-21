@@ -1101,21 +1101,6 @@ typedef enum libdeflate_result (*decompress_func_t)
 #undef EXTRACT_VARBITS8
 #include "decompress_template.h"
 
-/*
- * Streaming instantiation: same decoder, but suspends at block boundaries (see
- * libdeflate_deflate_decompress_stream()). DEFLATE_STREAMING enables the
- * streaming-only code paths in the template, and OVERREAD_HANDLER() turns an
- * input-overread into a clean suspension.
- */
-#define FUNCNAME deflate_decompress_stream_impl
-#define DEFLATE_STREAMING 1
-#undef OVERREAD_HANDLER
-#define OVERREAD_HANDLER()	do { if (!d->end_of_input) goto need_more_input; } while (0)
-#include "decompress_template.h"
-#undef DEFLATE_STREAMING
-#undef OVERREAD_HANDLER
-#define OVERREAD_HANDLER()	/* nothing */
-
 /* Include architecture-specific implementation(s) if available. */
 #undef DEFAULT_IMPL
 #undef arch_select_decompress_func
@@ -1156,6 +1141,66 @@ dispatch_decomp(struct libdeflate_decompressor *d,
 /* The best implementation is statically known, so call it directly. */
 #  define decompress_impl DEFAULT_IMPL
 #endif
+
+/*
+ * Streaming decompressor instantiations (libdeflate_deflate_decompress_stream()).
+ * Same decoder, but DEFLATE_STREAMING makes it suspend at block boundaries and
+ * OVERREAD_HANDLER() turns an input overread into a clean suspension. We mirror
+ * the one-shot arch dispatch above so the streaming path also gets the x86 BMI2
+ * implementation at runtime; otherwise streaming would be stuck on the generic
+ * code on BMI2-capable CPUs.
+ */
+#define DEFLATE_STREAMING 1
+#undef OVERREAD_HANDLER
+#define OVERREAD_HANDLER()	do { if (!d->end_of_input) goto need_more_input; } while (0)
+
+#define FUNCNAME deflate_decompress_stream_default
+#undef ATTRIBUTES
+#undef EXTRACT_VARBITS
+#undef EXTRACT_VARBITS8
+#include "decompress_template.h"
+
+#undef DEFAULT_STREAM_IMPL
+#undef arch_select_stream_decompress_func
+#if defined(ARCH_X86_32) || defined(ARCH_X86_64)
+#  include "x86/decompress_stream_impl.h"
+#endif
+
+#ifndef DEFAULT_STREAM_IMPL
+#  define DEFAULT_STREAM_IMPL deflate_decompress_stream_default
+#endif
+
+#ifdef arch_select_stream_decompress_func
+static enum libdeflate_result
+dispatch_stream_decomp(struct libdeflate_decompressor *d,
+		       const void *in, size_t in_nbytes,
+		       void *out, size_t out_nbytes_avail,
+		       size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret);
+
+static volatile decompress_func_t stream_decompress_impl = dispatch_stream_decomp;
+
+static enum libdeflate_result
+dispatch_stream_decomp(struct libdeflate_decompressor *d,
+		       const void *in, size_t in_nbytes,
+		       void *out, size_t out_nbytes_avail,
+		       size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret)
+{
+	decompress_func_t f = arch_select_stream_decompress_func();
+
+	if (f == NULL)
+		f = DEFAULT_STREAM_IMPL;
+
+	stream_decompress_impl = f;
+	return f(d, in, in_nbytes, out, out_nbytes_avail,
+		 actual_in_nbytes_ret, actual_out_nbytes_ret);
+}
+#else
+#  define stream_decompress_impl DEFAULT_STREAM_IMPL
+#endif
+
+#undef DEFLATE_STREAMING
+#undef OVERREAD_HANDLER
+#define OVERREAD_HANDLER()	/* nothing */
 
 /*
  * This is the main DEFLATE decompression routine.  See libdeflate.h for the
@@ -1208,11 +1253,10 @@ libdeflate_deflate_decompress_stream(struct libdeflate_decompressor *d,
 {
 	d->end_of_input = (end_of_input != 0);
 	d->window_nbytes = window_nbytes;
-	/* Streaming uses the generic instantiation (no arch dispatch needed). */
-	return deflate_decompress_stream_impl(d, in, in_nbytes,
-					      out, out_nbytes_avail,
-					      actual_in_nbytes_ret,
-					      actual_out_nbytes_ret);
+	return stream_decompress_impl(d, in, in_nbytes,
+				      out, out_nbytes_avail,
+				      actual_in_nbytes_ret,
+				      actual_out_nbytes_ret);
 }
 
 LIBDEFLATEAPI struct libdeflate_decompressor *
