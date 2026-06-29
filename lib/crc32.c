@@ -235,7 +235,14 @@ typedef u32 (*crc32_func_t)(u32 crc, const u8 *p, size_t len);
 #ifdef arch_select_crc32_func
 static u32 dispatch_crc32(u32 crc, const u8 *p, size_t len);
 
-static volatile crc32_func_t crc32_impl = dispatch_crc32;
+/*
+ * Resolved to the best implementation on the first call. Accessed with relaxed atomics: the
+ * first-call resolution is a benign race (every thread computes the same pointer, a pure function
+ * of the CPU), but a plain load racing with the store is undefined behavior and is flagged by
+ * ThreadSanitizer. Relaxed ordering suffices because no other memory is published through it.
+ */
+static crc32_func_t crc32_impl = dispatch_crc32;
+#define crc32_impl_load()	__atomic_load_n(&crc32_impl, __ATOMIC_RELAXED)
 
 /* Choose the best implementation at runtime. */
 static u32 dispatch_crc32(u32 crc, const u8 *p, size_t len)
@@ -245,12 +252,12 @@ static u32 dispatch_crc32(u32 crc, const u8 *p, size_t len)
 	if (f == NULL)
 		f = DEFAULT_IMPL;
 
-	crc32_impl = f;
+	__atomic_store_n(&crc32_impl, f, __ATOMIC_RELAXED);
 	return f(crc, p, len);
 }
 #else
 /* The best implementation is statically known, so call it directly. */
-#define crc32_impl DEFAULT_IMPL
+#define crc32_impl_load()	(DEFAULT_IMPL)
 #endif
 
 LIBDEFLATEAPI u32
@@ -258,5 +265,5 @@ libdeflate_crc32(u32 crc, const void *p, size_t len)
 {
 	if (p == NULL) /* Return initial value. */
 		return 0;
-	return ~crc32_impl(~crc, p, len);
+	return ~crc32_impl_load()(~crc, p, len);
 }

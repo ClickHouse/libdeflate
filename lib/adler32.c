@@ -135,7 +135,14 @@ typedef u32 (*adler32_func_t)(u32 adler, const u8 *p, size_t len);
 #ifdef arch_select_adler32_func
 static u32 dispatch_adler32(u32 adler, const u8 *p, size_t len);
 
-static volatile adler32_func_t adler32_impl = dispatch_adler32;
+/*
+ * Resolved to the best implementation on the first call. Accessed with relaxed atomics: the
+ * first-call resolution is a benign race (every thread computes the same pointer, a pure function
+ * of the CPU), but a plain load racing with the store is undefined behavior and is flagged by
+ * ThreadSanitizer. Relaxed ordering suffices because no other memory is published through it.
+ */
+static adler32_func_t adler32_impl = dispatch_adler32;
+#define adler32_impl_load()	__atomic_load_n(&adler32_impl, __ATOMIC_RELAXED)
 
 /* Choose the best implementation at runtime. */
 static u32 dispatch_adler32(u32 adler, const u8 *p, size_t len)
@@ -145,12 +152,12 @@ static u32 dispatch_adler32(u32 adler, const u8 *p, size_t len)
 	if (f == NULL)
 		f = DEFAULT_IMPL;
 
-	adler32_impl = f;
+	__atomic_store_n(&adler32_impl, f, __ATOMIC_RELAXED);
 	return f(adler, p, len);
 }
 #else
 /* The best implementation is statically known, so call it directly. */
-#define adler32_impl DEFAULT_IMPL
+#define adler32_impl_load()	(DEFAULT_IMPL)
 #endif
 
 LIBDEFLATEAPI u32
@@ -158,5 +165,5 @@ libdeflate_adler32(u32 adler, const void *buffer, size_t len)
 {
 	if (buffer == NULL) /* Return initial value. */
 		return 1;
-	return adler32_impl(adler, buffer, len);
+	return adler32_impl_load()(adler, buffer, len);
 }
