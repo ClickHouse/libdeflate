@@ -1119,7 +1119,14 @@ dispatch_decomp(struct libdeflate_decompressor *d,
 		void *out, size_t out_nbytes_avail,
 		size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret);
 
-static volatile decompress_func_t decompress_impl = dispatch_decomp;
+/*
+ * Resolved to the best implementation on the first call. Accessed with relaxed atomics: the
+ * first-call resolution is a benign race (every thread computes the same pointer, a pure function
+ * of the CPU), but a plain load racing with the store is undefined behavior and is flagged by
+ * ThreadSanitizer. Relaxed ordering suffices because no other memory is published through it.
+ */
+static decompress_func_t decompress_impl = dispatch_decomp;
+#define decompress_impl_load()	__atomic_load_n(&decompress_impl, __ATOMIC_RELAXED)
 
 /* Choose the best implementation at runtime. */
 static enum libdeflate_result
@@ -1133,13 +1140,13 @@ dispatch_decomp(struct libdeflate_decompressor *d,
 	if (f == NULL)
 		f = DEFAULT_IMPL;
 
-	decompress_impl = f;
+	__atomic_store_n(&decompress_impl, f, __ATOMIC_RELAXED);
 	return f(d, in, in_nbytes, out, out_nbytes_avail,
 		 actual_in_nbytes_ret, actual_out_nbytes_ret);
 }
 #else
 /* The best implementation is statically known, so call it directly. */
-#  define decompress_impl DEFAULT_IMPL
+#  define decompress_impl_load()	(DEFAULT_IMPL)
 #endif
 
 /*
@@ -1177,7 +1184,9 @@ dispatch_stream_decomp(struct libdeflate_decompressor *d,
 		       void *out, size_t out_nbytes_avail,
 		       size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret);
 
-static volatile decompress_func_t stream_decompress_impl = dispatch_stream_decomp;
+/* See decompress_impl above: relaxed-atomic access to the runtime-resolved implementation pointer. */
+static decompress_func_t stream_decompress_impl = dispatch_stream_decomp;
+#define stream_decompress_impl_load()	__atomic_load_n(&stream_decompress_impl, __ATOMIC_RELAXED)
 
 static enum libdeflate_result
 dispatch_stream_decomp(struct libdeflate_decompressor *d,
@@ -1190,12 +1199,12 @@ dispatch_stream_decomp(struct libdeflate_decompressor *d,
 	if (f == NULL)
 		f = DEFAULT_STREAM_IMPL;
 
-	stream_decompress_impl = f;
+	__atomic_store_n(&stream_decompress_impl, f, __ATOMIC_RELAXED);
 	return f(d, in, in_nbytes, out, out_nbytes_avail,
 		 actual_in_nbytes_ret, actual_out_nbytes_ret);
 }
 #else
-#  define stream_decompress_impl DEFAULT_STREAM_IMPL
+#  define stream_decompress_impl_load()	(DEFAULT_STREAM_IMPL)
 #endif
 
 #undef DEFLATE_STREAMING
@@ -1217,8 +1226,8 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *d,
 				 size_t *actual_in_nbytes_ret,
 				 size_t *actual_out_nbytes_ret)
 {
-	return decompress_impl(d, in, in_nbytes, out, out_nbytes_avail,
-			       actual_in_nbytes_ret, actual_out_nbytes_ret);
+	return decompress_impl_load()(d, in, in_nbytes, out, out_nbytes_avail,
+				      actual_in_nbytes_ret, actual_out_nbytes_ret);
 }
 
 LIBDEFLATEAPI enum libdeflate_result
@@ -1253,10 +1262,10 @@ libdeflate_deflate_decompress_stream(struct libdeflate_decompressor *d,
 {
 	d->end_of_input = (end_of_input != 0);
 	d->window_nbytes = window_nbytes;
-	return stream_decompress_impl(d, in, in_nbytes,
-				      out, out_nbytes_avail,
-				      actual_in_nbytes_ret,
-				      actual_out_nbytes_ret);
+	return stream_decompress_impl_load()(d, in, in_nbytes,
+					     out, out_nbytes_avail,
+					     actual_in_nbytes_ret,
+					     actual_out_nbytes_ret);
 }
 
 LIBDEFLATEAPI struct libdeflate_decompressor *
