@@ -51,15 +51,25 @@
      (defined(_WIN32) && defined(ARCH_ARM64)))
 /* Runtime ARM CPU feature detection is supported. */
 #  define ARM_CPU_FEATURES_KNOWN	(1U << 31)
-extern volatile u32 libdeflate_arm_cpu_features;
+extern u32 libdeflate_arm_cpu_features;
 
 void libdeflate_init_arm_cpu_features(void);
 
+/*
+ * Resolved on the first call. Accessed with relaxed atomics: the first-call initialization is a
+ * benign race (every thread computes the same features bitmask, a pure function of the CPU), but
+ * a plain load racing with the store in libdeflate_init_arm_cpu_features() is undefined behavior
+ * and is flagged by ThreadSanitizer. Relaxed ordering suffices because no other memory is
+ * published through it.
+ */
 static inline u32 get_arm_cpu_features(void)
 {
-	if (libdeflate_arm_cpu_features == 0)
+	u32 features = __atomic_load_n(&libdeflate_arm_cpu_features, __ATOMIC_RELAXED);
+	if (features == 0) {
 		libdeflate_init_arm_cpu_features();
-	return libdeflate_arm_cpu_features;
+		features = __atomic_load_n(&libdeflate_arm_cpu_features, __ATOMIC_RELAXED);
+	}
+	return features;
 }
 #else
 static inline u32 get_arm_cpu_features(void) { return 0; }
