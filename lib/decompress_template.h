@@ -73,17 +73,36 @@ FUNCNAME(struct libdeflate_decompressor * restrict d,
 	/*
 	 * Streaming state. 'window_nbytes' bytes of previously produced output
 	 * precede 'out' (for resolving back-references). The checkpoint (cp_*)
-	 * holds the byte-aligned resume state at the last block boundary; on
-	 * suspension we roll back to it.
+	 * holds the sub-byte-aligned resume state at the last resumable
+	 * position: a block boundary, or a symbol boundary inside a Huffman
+	 * block ('cp_in_block' distinguishes the two). On suspension we roll
+	 * back to it. Checkpointing at symbol granularity (not just block
+	 * boundaries) is what keeps streaming decompression linear-time even
+	 * when a single DEFLATE block spans the whole stream, as produced by
+	 * e.g. zlib-ng at compression level 1.
 	 */
 	const size_t window_nbytes = d->window_nbytes;
 	const u8 *cp_in_next = in_next;
 	u8 *cp_out_next = out_next;
 	bitbuf_t cp_bitbuf = d->saved_bitbuf;
 	u32 cp_bitsleft = d->saved_bitsleft;
+	bool cp_in_block = false;
 
 	bitbuf = d->saved_bitbuf;
 	bitsleft = d->saved_bitsleft;
+
+	if (d->in_block) {
+		/*
+		 * Resuming at a symbol boundary inside a Huffman block: the
+		 * litlen/offset decode tables in *d still describe the block's
+		 * codes (nothing rebuilds them between the suspension and now),
+		 * so skip the block header and go straight back to decoding
+		 * symbols.
+		 */
+		is_final_block = d->block_is_final;
+		cp_in_block = true;
+		goto have_decode_tables;
+	}
 #endif
 
 next_block:
@@ -93,10 +112,12 @@ next_block:
 	/* Checkpoint the byte-aligned resume state at this block boundary. */
 	{
 		u32 cp_bl = (u8)bitsleft;
+		SAFETY_CHECK(overread_count <= (cp_bl >> 3));
 		cp_in_next = in_next - ((cp_bl >> 3) - overread_count);
 		cp_out_next = out_next;
 		cp_bitsleft = cp_bl & 7;
 		cp_bitbuf = bitbuf & (((bitbuf_t)1 << cp_bitsleft) - 1);
+		cp_in_block = false;
 	}
 #endif
 
@@ -734,6 +755,36 @@ generic_loop:
 		const u8 *src;
 		u8 *dst;
 
+#ifdef DEFLATE_STREAMING
+		/*
+		 * Checkpoint this symbol boundary, so that a suspension inside
+		 * the block (input exhausted, or output full) resumes here
+		 * instead of rolling back to the block start. Without this, a
+		 * single DEFLATE block spanning the whole stream would be
+		 * re-decoded from its start on every refill, making streaming
+		 * decompression quadratic in the block's compressed size.
+		 * Suspensions can only trigger from this loop (the fastloop's
+		 * entry conditions leave it enough input and output slack), so
+		 * checkpointing here is sufficient and keeps the fastloop free
+		 * of extra work.
+		 *
+		 * Implicit appended zero bytes can never have been consumed at
+		 * a symbol boundary of a valid stream (they can only appear
+		 * past the final block, or when truncated data was declared
+		 * complete via 'end_of_input'), so reaching this point with
+		 * more overread bytes than unconsumed whole bytes in the
+		 * bitbuffer means the data is bad.
+		 */
+		{
+			u32 cp_bl = (u8)bitsleft;
+			SAFETY_CHECK(overread_count <= (cp_bl >> 3));
+			cp_in_next = in_next - ((cp_bl >> 3) - overread_count);
+			cp_out_next = out_next;
+			cp_bitsleft = cp_bl & 7;
+			cp_bitbuf = bitbuf & (((bitbuf_t)1 << cp_bitsleft) - 1);
+			cp_in_block = true;
+		}
+#endif
 		REFILL_BITS();
 		entry = d->u.litlen_decode_table[bitbuf & litlen_tablemask];
 		saved_bitbuf = bitbuf;
@@ -835,12 +886,19 @@ block_done:
 
 #ifdef DEFLATE_STREAMING
 	/*
-	 * Suspension points: roll back to the last block boundary checkpoint and
+	 * Suspension points: roll back to the last checkpoint (a block
+	 * boundary, or a symbol boundary inside the current Huffman block) and
 	 * report how much input/output was fully consumed/produced up to it.
+	 * 'is_final_block' describes the current block, which is also the
+	 * checkpoint's block whenever 'cp_in_block' is set: the checkpoint is
+	 * re-taken at every block boundary, so it can never lag behind in a
+	 * previous block.
 	 */
 need_more_input:
 	d->saved_bitbuf = cp_bitbuf;
 	d->saved_bitsleft = cp_bitsleft;
+	d->in_block = cp_in_block;
+	d->block_is_final = is_final_block;
 	*actual_in_nbytes_ret = cp_in_next - (const u8 *)in;
 	*actual_out_nbytes_ret = cp_out_next - (u8 *)out;
 	return LIBDEFLATE_STREAM_NEED_INPUT;
@@ -848,6 +906,8 @@ need_more_input:
 need_more_output:
 	d->saved_bitbuf = cp_bitbuf;
 	d->saved_bitsleft = cp_bitsleft;
+	d->in_block = cp_in_block;
+	d->block_is_final = is_final_block;
 	*actual_in_nbytes_ret = cp_in_next - (const u8 *)in;
 	*actual_out_nbytes_ret = cp_out_next - (u8 *)out;
 	return LIBDEFLATE_STREAM_NEED_OUTPUT;
