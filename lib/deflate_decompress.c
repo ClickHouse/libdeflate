@@ -686,8 +686,16 @@ struct libdeflate_decompressor {
 	 * Streaming decompression state (libdeflate_deflate_decompress_stream()).
 	 * Used only by the DEFLATE_STREAMING instantiation of the decode template;
 	 * the normal one-shot path never touches these.
+	 *
+	 * 'saved_bitbuf'/'saved_bitsleft' hold the sub-byte bit position of the
+	 * resume point. When 'in_block' is set, the resume point is a symbol
+	 * boundary inside a Huffman block whose BFINAL flag is 'block_is_final'
+	 * and whose litlen/offset decode tables are the ones stored above;
+	 * otherwise it is a block boundary.
 	 */
 	bool end_of_input;
+	bool in_block;
+	bool block_is_final;
 	size_t window_nbytes;
 	bitbuf_t saved_bitbuf;
 	u32 saved_bitsleft;
@@ -1245,6 +1253,8 @@ LIBDEFLATEAPI void
 libdeflate_deflate_decompress_stream_reset(struct libdeflate_decompressor *d)
 {
 	d->end_of_input = false;
+	d->in_block = false;
+	d->block_is_final = false;
 	d->window_nbytes = 0;
 	d->saved_bitbuf = 0;
 	d->saved_bitsleft = 0;

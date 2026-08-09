@@ -224,8 +224,9 @@ enum libdeflate_result {
 	LIBDEFLATE_INSUFFICIENT_SPACE = 3,
 
 	/* Streaming only (libdeflate_deflate_decompress_stream()): the input ran
-	 * out at a block boundary and 'end_of_input' was false. Provide more
-	 * input and call again. */
+	 * out and 'end_of_input' was false. All input up to the last resumable
+	 * position (a symbol boundary within the current block, or a block
+	 * boundary) was consumed. Provide more input and call again. */
 	LIBDEFLATE_STREAM_NEED_INPUT = 4,
 
 	/* Streaming only: the output buffer filled up. Drain it (carrying the
@@ -287,8 +288,10 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *decompressor,
  * Streaming raw-DEFLATE decompression (a ClickHouse addition).
  *
  * Decompresses as much of the (possibly partial) input as it can, suspending at
- * DEFLATE block boundaries so that arbitrarily large streams can be decompressed
- * with bounded memory. Reuses libdeflate's fast table-driven decoder.
+ * symbol boundaries so that arbitrarily large streams - including streams whose
+ * single DEFLATE block spans the whole input, as produced by e.g. zlib-ng at
+ * compression level 1 - can be decompressed in linear time with bounded memory.
+ * Reuses libdeflate's fast table-driven decoder.
  *
  * Window handling: back-references reach up to 32 KiB. The caller must place the
  * last 'window_nbytes' (<= 32768) bytes of previously produced output immediately
@@ -300,10 +303,14 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *decompressor,
  *
  * Returns:
  *   LIBDEFLATE_SUCCESS            - reached the final block (stream complete).
- *   LIBDEFLATE_STREAM_NEED_INPUT  - consumed input up to a block boundary; supply
- *                                   more input (from *actual_in_nbytes_ret) and call again.
- *   LIBDEFLATE_STREAM_NEED_OUTPUT - output buffer full at a block boundary; drain
- *                                   it, slide the window, and call again.
+ *   LIBDEFLATE_STREAM_NEED_INPUT  - consumed input up to the last resumable
+ *                                   position (a symbol boundary within the current
+ *                                   block, or a block boundary); supply more input
+ *                                   (from *actual_in_nbytes_ret) and call again.
+ *   LIBDEFLATE_STREAM_NEED_OUTPUT - output buffer full; drain it, slide the
+ *                                   window, and call again. More output always
+ *                                   follows, since the suspended item itself did
+ *                                   not fit.
  *   LIBDEFLATE_BAD_DATA           - the input was invalid.
  *
  * *actual_in_nbytes_ret / *actual_out_nbytes_ret receive the bytes consumed /
