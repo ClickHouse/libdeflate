@@ -62,7 +62,10 @@ FUNCNAME(struct libdeflate_decompressor * restrict d,
 	u32 bitsleft = 0;
 	size_t overread_count = 0;
 
-	bool is_final_block;
+	/* Initialized to keep the streaming suspension paths (which store it into the
+	 * decompressor unconditionally, guarded by 'in_block' on resume) away from an
+	 * indeterminate read when suspending before the first block header is decoded. */
+	bool is_final_block = false;
 	unsigned block_type;
 	unsigned num_litlen_syms;
 	unsigned num_offset_syms;
