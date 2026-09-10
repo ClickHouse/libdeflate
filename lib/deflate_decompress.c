@@ -244,6 +244,7 @@ do {									\
 				bitbuf |= (bitbuf_t)*in_next++ <<	\
 					  (u8)bitsleft;			\
 			} else {					\
+				OVERREAD_HANDLER();			\
 				overread_count++;			\
 				SAFETY_CHECK(overread_count <=		\
 					     sizeof(bitbuf_t));		\
@@ -252,6 +253,15 @@ do {									\
 		}							\
 	}								\
 } while (0)
+
+/*
+ * Hook invoked by REFILL_BITS() when it would overread the input. It is a no-op
+ * for the normal (one-shot) decompressor, and is redefined to suspend at a block
+ * boundary for the streaming instantiation of the template.
+ */
+#ifndef OVERREAD_HANDLER
+#  define OVERREAD_HANDLER()	/* nothing */
+#endif
 
 /*
  * REFILL_BITS_IN_FASTLOOP() is like REFILL_BITS(), but it doesn't check for the
@@ -671,6 +681,16 @@ struct libdeflate_decompressor {
 
 	bool static_codes_loaded;
 	unsigned litlen_tablebits;
+
+	/*
+	 * Streaming decompression state (libdeflate_deflate_decompress_stream()).
+	 * Used only by the DEFLATE_STREAMING instantiation of the decode template;
+	 * the normal one-shot path never touches these.
+	 */
+	bool end_of_input;
+	size_t window_nbytes;
+	bitbuf_t saved_bitbuf;
+	u32 saved_bitsleft;
 
 	/* The free() function for this struct, chosen at allocation time */
 	free_func_t free_func;
@@ -1099,7 +1119,14 @@ dispatch_decomp(struct libdeflate_decompressor * restrict d,
 		void * restrict out, size_t out_nbytes_avail,
 		size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret);
 
-static volatile decompress_func_t decompress_impl = dispatch_decomp;
+/*
+ * Resolved to the best implementation on the first call. Accessed with relaxed atomics: the
+ * first-call resolution is a benign race (every thread computes the same pointer, a pure function
+ * of the CPU), but a plain load racing with the store is undefined behavior and is flagged by
+ * ThreadSanitizer. Relaxed ordering suffices because no other memory is published through it.
+ */
+static decompress_func_t decompress_impl = dispatch_decomp;
+#define decompress_impl_load()	__atomic_load_n(&decompress_impl, __ATOMIC_RELAXED)
 
 /* Choose the best implementation at runtime. */
 static enum libdeflate_result
@@ -1113,14 +1140,76 @@ dispatch_decomp(struct libdeflate_decompressor * restrict d,
 	if (f == NULL)
 		f = DEFAULT_IMPL;
 
-	decompress_impl = f;
+	__atomic_store_n(&decompress_impl, f, __ATOMIC_RELAXED);
 	return f(d, in, in_nbytes, out, out_nbytes_avail,
 		 actual_in_nbytes_ret, actual_out_nbytes_ret);
 }
 #else
 /* The best implementation is statically known, so call it directly. */
-#  define decompress_impl DEFAULT_IMPL
+#  define decompress_impl_load()	(DEFAULT_IMPL)
 #endif
+
+/*
+ * Streaming decompressor instantiations (libdeflate_deflate_decompress_stream()).
+ * Same decoder, but DEFLATE_STREAMING makes it suspend at block boundaries and
+ * OVERREAD_HANDLER() turns an input overread into a clean suspension. We mirror
+ * the one-shot arch dispatch above so the streaming path also gets the x86 BMI2
+ * implementation at runtime; otherwise streaming would be stuck on the generic
+ * code on BMI2-capable CPUs.
+ */
+#define DEFLATE_STREAMING 1
+#undef OVERREAD_HANDLER
+#define OVERREAD_HANDLER()	do { if (!d->end_of_input) goto need_more_input; } while (0)
+
+#define FUNCNAME deflate_decompress_stream_default
+#undef ATTRIBUTES
+#undef EXTRACT_VARBITS
+#undef EXTRACT_VARBITS8
+#include "decompress_template.h"
+
+#undef DEFAULT_STREAM_IMPL
+#undef arch_select_stream_decompress_func
+#if defined(ARCH_X86_32) || defined(ARCH_X86_64)
+#  include "x86/decompress_stream_impl.h"
+#endif
+
+#ifndef DEFAULT_STREAM_IMPL
+#  define DEFAULT_STREAM_IMPL deflate_decompress_stream_default
+#endif
+
+#ifdef arch_select_stream_decompress_func
+static enum libdeflate_result
+dispatch_stream_decomp(struct libdeflate_decompressor *d,
+		       const void *in, size_t in_nbytes,
+		       void *out, size_t out_nbytes_avail,
+		       size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret);
+
+/* See decompress_impl above: relaxed-atomic access to the runtime-resolved implementation pointer. */
+static decompress_func_t stream_decompress_impl = dispatch_stream_decomp;
+#define stream_decompress_impl_load()	__atomic_load_n(&stream_decompress_impl, __ATOMIC_RELAXED)
+
+static enum libdeflate_result
+dispatch_stream_decomp(struct libdeflate_decompressor *d,
+		       const void *in, size_t in_nbytes,
+		       void *out, size_t out_nbytes_avail,
+		       size_t *actual_in_nbytes_ret, size_t *actual_out_nbytes_ret)
+{
+	decompress_func_t f = arch_select_stream_decompress_func();
+
+	if (f == NULL)
+		f = DEFAULT_STREAM_IMPL;
+
+	__atomic_store_n(&stream_decompress_impl, f, __ATOMIC_RELAXED);
+	return f(d, in, in_nbytes, out, out_nbytes_avail,
+		 actual_in_nbytes_ret, actual_out_nbytes_ret);
+}
+#else
+#  define stream_decompress_impl_load()	(DEFAULT_STREAM_IMPL)
+#endif
+
+#undef DEFLATE_STREAMING
+#undef OVERREAD_HANDLER
+#define OVERREAD_HANDLER()	/* nothing */
 
 /*
  * This is the main DEFLATE decompression routine.  See libdeflate.h for the
@@ -1137,8 +1226,8 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *d,
 				 size_t *actual_in_nbytes_ret,
 				 size_t *actual_out_nbytes_ret)
 {
-	return decompress_impl(d, in, in_nbytes, out, out_nbytes_avail,
-			       actual_in_nbytes_ret, actual_out_nbytes_ret);
+	return decompress_impl_load()(d, in, in_nbytes, out, out_nbytes_avail,
+				      actual_in_nbytes_ret, actual_out_nbytes_ret);
 }
 
 LIBDEFLATEAPI enum libdeflate_result
@@ -1150,6 +1239,33 @@ libdeflate_deflate_decompress(struct libdeflate_decompressor *d,
 	return libdeflate_deflate_decompress_ex(d, in, in_nbytes,
 						out, out_nbytes_avail,
 						NULL, actual_out_nbytes_ret);
+}
+
+LIBDEFLATEAPI void
+libdeflate_deflate_decompress_stream_reset(struct libdeflate_decompressor *d)
+{
+	d->end_of_input = false;
+	d->window_nbytes = 0;
+	d->saved_bitbuf = 0;
+	d->saved_bitsleft = 0;
+	d->static_codes_loaded = false;
+}
+
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_stream(struct libdeflate_decompressor *d,
+				     int end_of_input,
+				     const void *in, size_t in_nbytes,
+				     void *out, size_t out_nbytes_avail,
+				     size_t window_nbytes,
+				     size_t *actual_in_nbytes_ret,
+				     size_t *actual_out_nbytes_ret)
+{
+	d->end_of_input = (end_of_input != 0);
+	d->window_nbytes = window_nbytes;
+	return stream_decompress_impl_load()(d, in, in_nbytes,
+					     out, out_nbytes_avail,
+					     actual_in_nbytes_ret,
+					     actual_out_nbytes_ret);
 }
 
 LIBDEFLATEAPI struct libdeflate_decompressor *

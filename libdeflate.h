@@ -88,6 +88,23 @@ libdeflate_deflate_compress(struct libdeflate_compressor *compressor,
 			    void *out, size_t out_nbytes_avail);
 
 /*
+ * libdeflate_deflate_compress_stream_chunk() compresses one chunk of a DEFLATE
+ * stream WITHOUT terminating it. All emitted blocks are non-final and the output
+ * ends on a byte boundary (via an empty stored "sync flush" block), so the
+ * outputs of consecutive calls can be concatenated. After the last chunk, append
+ * a final block (e.g. the two bytes 0x03 0x00, an empty final block) to terminate
+ * the stream. This is a ClickHouse addition that lets libdeflate back a streaming
+ * compressor while still producing a single valid DEFLATE/gzip/zlib member.
+ *
+ * Returns the number of bytes written, or 0 if 'out_nbytes_avail' was too small;
+ * size 'libdeflate_deflate_compress_bound(in_nbytes) + 8' to be safe.
+ */
+LIBDEFLATEAPI size_t
+libdeflate_deflate_compress_stream_chunk(struct libdeflate_compressor *compressor,
+					 const void *in, size_t in_nbytes,
+					 void *out, size_t out_nbytes_avail);
+
+/*
  * libdeflate_deflate_compress_bound() returns a worst-case upper bound on the
  * number of bytes of compressed data that may be produced by compressing any
  * buffer of length less than or equal to 'in_nbytes' using
@@ -206,6 +223,15 @@ enum libdeflate_result {
 	/* The data would have decompressed to more than 'out_nbytes_avail'
 	 * bytes.  */
 	LIBDEFLATE_INSUFFICIENT_SPACE = 3,
+
+	/* Streaming only (libdeflate_deflate_decompress_stream()): the input ran
+	 * out at a block boundary and 'end_of_input' was false. Provide more
+	 * input and call again. */
+	LIBDEFLATE_STREAM_NEED_INPUT = 4,
+
+	/* Streaming only: the output buffer filled up. Drain it (carrying the
+	 * last 32 KiB as the window) and call again. */
+	LIBDEFLATE_STREAM_NEED_OUTPUT = 5,
 };
 
 /*
@@ -257,6 +283,47 @@ libdeflate_deflate_decompress_ex(struct libdeflate_decompressor *decompressor,
 				 void *out, size_t out_nbytes_avail,
 				 size_t *actual_in_nbytes_ret,
 				 size_t *actual_out_nbytes_ret);
+
+/*
+ * Streaming raw-DEFLATE decompression (a ClickHouse addition).
+ *
+ * Decompresses as much of the (possibly partial) input as it can, suspending at
+ * DEFLATE block boundaries so that arbitrarily large streams can be decompressed
+ * with bounded memory. Reuses libdeflate's fast table-driven decoder.
+ *
+ * Window handling: back-references reach up to 32 KiB. The caller must place the
+ * last 'window_nbytes' (<= 32768) bytes of previously produced output immediately
+ * BEFORE 'out' (contiguously), and pass that count as 'window_nbytes'. For the
+ * first call of a stream, 'window_nbytes' is 0.
+ *
+ * 'end_of_input' must be nonzero only when 'in'..'in'+'in_nbytes' contains the
+ * end of the DEFLATE stream.
+ *
+ * Returns:
+ *   LIBDEFLATE_SUCCESS            - reached the final block (stream complete).
+ *   LIBDEFLATE_STREAM_NEED_INPUT  - consumed input up to a block boundary; supply
+ *                                   more input (from *actual_in_nbytes_ret) and call again.
+ *   LIBDEFLATE_STREAM_NEED_OUTPUT - output buffer full at a block boundary; drain
+ *                                   it, slide the window, and call again.
+ *   LIBDEFLATE_BAD_DATA           - the input was invalid.
+ *
+ * *actual_in_nbytes_ret / *actual_out_nbytes_ret receive the bytes consumed /
+ * produced (both required, must be non-NULL). Call
+ * libdeflate_deflate_decompress_stream_reset() before starting a new stream on a
+ * reused decompressor.
+ */
+LIBDEFLATEAPI enum libdeflate_result
+libdeflate_deflate_decompress_stream(struct libdeflate_decompressor *decompressor,
+				     int end_of_input,
+				     const void *in, size_t in_nbytes,
+				     void *out, size_t out_nbytes_avail,
+				     size_t window_nbytes,
+				     size_t *actual_in_nbytes_ret,
+				     size_t *actual_out_nbytes_ret);
+
+/* Reset streaming state so the decompressor can start a new stream. */
+LIBDEFLATEAPI void
+libdeflate_deflate_decompress_stream_reset(struct libdeflate_decompressor *decompressor);
 
 /*
  * Like libdeflate_deflate_decompress(), but assumes the zlib wrapper format
