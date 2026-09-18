@@ -202,7 +202,7 @@ static const struct cpu_feature arm_cpu_feature_table[] = {
 	{ARM_CPU_FEATURE_DOTPROD,	"dotprod"},
 };
 
-volatile u32 libdeflate_arm_cpu_features = 0;
+u32 libdeflate_arm_cpu_features = 0;
 
 void libdeflate_init_arm_cpu_features(void)
 {
@@ -224,7 +224,8 @@ void libdeflate_init_arm_cpu_features(void)
 	disable_cpu_features_for_testing(&features, arm_cpu_feature_table,
 					 ARRAY_LEN(arm_cpu_feature_table));
 
-	libdeflate_arm_cpu_features = features | ARM_CPU_FEATURES_KNOWN;
+	__atomic_store_n(&libdeflate_arm_cpu_features,
+			 features | ARM_CPU_FEATURES_KNOWN, __ATOMIC_RELAXED);
 }
 
 #endif /* ARM_CPU_FEATURES_KNOWN */
