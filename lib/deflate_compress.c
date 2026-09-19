@@ -463,6 +463,13 @@ struct libdeflate_compressor {
 	/* The compression level with which this compressor was created */
 	unsigned compression_level;
 
+	/*
+	 * If true, deflate_flush_block() forces every block to be non-final, so
+	 * that the output of one compression call can be concatenated with more
+	 * DEFLATE data. Set transiently by libdeflate_deflate_compress_stream_chunk().
+	 */
+	bool stream_chunk;
+
 	/* Anything of this size or less we won't bother trying to compress. */
 	size_t max_passthrough_size;
 
@@ -1710,6 +1717,14 @@ deflate_flush_block(struct libdeflate_compressor *c,
 		    const struct deflate_sequence *sequences,
 		    bool is_final_block)
 {
+	/*
+	 * In stream-chunk mode, never terminate the DEFLATE stream: keep every
+	 * block non-final so the caller can append further blocks. Only the
+	 * block-header BFINAL bit value changes, not its cost, so the output
+	 * size accounting below is unaffected.
+	 */
+	if (c->stream_chunk)
+		is_final_block = false;
 	/*
 	 * It is hard to get compilers to understand that writes to 'os->next'
 	 * don't alias 'os'.  That hurts performance significantly, as
@@ -3918,6 +3933,8 @@ libdeflate_alloc_compressor_ex(int compression_level,
 
 	c->compression_level = compression_level;
 
+	c->stream_chunk = false;
+
 	/*
 	 * The higher the compression level, the more we should bother trying to
 	 * compress very small inputs.
@@ -4068,6 +4085,118 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
 	}
 
 	/* Return the compressed size in bytes. */
+	return os.next - (u8 *)out;
+}
+
+/*
+ * Emit a "sync flush": a non-final empty stored block that also flushes any
+ * pending bits and aligns the output to a byte boundary. This is the same
+ * construct as zlib's Z_SYNC_FLUSH and lets us concatenate independently
+ * compressed DEFLATE segments into a single stream.
+ */
+static bool
+deflate_emit_sync_flush(struct deflate_output_bitstream *os)
+{
+	bitbuf_t bitbuf = os->bitbuf;
+	unsigned bitcount = os->bitcount;
+	u8 *out_next = os->next;
+
+	/* BFINAL=0, BTYPE=00 (3 bits, all zero). */
+	bitcount += 3;
+	while (bitcount >= 8) {
+		if (out_next >= os->end) { os->overflow = true; return false; }
+		*out_next++ = (u8)bitbuf;
+		bitbuf >>= 8;
+		bitcount -= 8;
+	}
+	/* Align to a byte boundary (the remaining header bits are zero). */
+	if (bitcount > 0) {
+		if (out_next >= os->end) { os->overflow = true; return false; }
+		*out_next++ = (u8)bitbuf;
+		bitcount = 0;
+	}
+	/* LEN = 0, NLEN = 0xFFFF. */
+	if (os->end - out_next < 4) { os->overflow = true; return false; }
+	*out_next++ = 0x00;
+	*out_next++ = 0x00;
+	*out_next++ = 0xFF;
+	*out_next++ = 0xFF;
+
+	os->bitbuf = 0;
+	os->bitcount = 0;
+	os->next = out_next;
+	return true;
+}
+
+/*
+ * Emit the input as one or more non-final stored (uncompressed) blocks. Used for
+ * stream chunks too small to be worth compressing. Assumes byte-aligned output.
+ */
+static bool
+deflate_emit_stored_nonfinal(struct deflate_output_bitstream *os,
+			     const u8 *in, size_t in_nbytes)
+{
+	u8 *out_next = os->next;
+	size_t offset = 0;
+
+	do {
+		size_t len = in_nbytes - offset;
+		if (len > UINT16_MAX)
+			len = UINT16_MAX;
+		if ((size_t)(os->end - out_next) < 5 + len) {
+			os->overflow = true;
+			return false;
+		}
+		*out_next++ = 0x00; /* BFINAL=0, BTYPE=00, + alignment padding */
+		put_unaligned_le16((u16)len, out_next);
+		out_next += 2;
+		put_unaligned_le16((u16)~len, out_next);
+		out_next += 2;
+		if (len) {
+			memcpy(out_next, in + offset, len);
+			out_next += len;
+		}
+		offset += len;
+	} while (offset < in_nbytes);
+
+	os->next = out_next;
+	return true;
+}
+
+/*
+ * Compress one chunk of a DEFLATE stream. Unlike libdeflate_deflate_compress(),
+ * the output is NOT terminated: all blocks are non-final and the output ends on
+ * a byte boundary, so the result can be concatenated with more chunks and then a
+ * final block. Returns the number of bytes written, or 0 if the output buffer is
+ * too small.
+ */
+LIBDEFLATEAPI size_t
+libdeflate_deflate_compress_stream_chunk(struct libdeflate_compressor *c,
+					 const void *in, size_t in_nbytes,
+					 void *out, size_t out_nbytes_avail)
+{
+	struct deflate_output_bitstream os;
+
+	os.bitbuf = 0;
+	os.bitcount = 0;
+	os.next = out;
+	os.end = os.next + out_nbytes_avail;
+	os.overflow = false;
+
+	if (in_nbytes > c->max_passthrough_size && c->impl != NULL) {
+		c->stream_chunk = true;
+		(*c->impl)(c, in, in_nbytes, &os);
+		c->stream_chunk = false;
+		if (os.overflow)
+			return 0;
+		if (!deflate_emit_sync_flush(&os))
+			return 0;
+	} else {
+		/* Small input (or level 0): store it, already byte-aligned. */
+		if (!deflate_emit_stored_nonfinal(&os, in, in_nbytes))
+			return 0;
+	}
+
 	return os.next - (u8 *)out;
 }
 
