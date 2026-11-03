@@ -211,10 +211,11 @@ libdeflate_gdeflate_compress_ex(struct libdeflate_compressor *c,
 		return 0;
 
 	for (size_t page = 0; page < npages; page++) {
-		size_t comp_page_nbytes;
+		size_t comp_page_nbytes = 0;
 
-		comp_page_nbytes = (*c->impl)(c, in_pages[page].data, in_pages[page].nbytes,
-					      out_pages[page].data, out_pages[page].nbytes);
+		if (likely(out_pages[page].nbytes >= GDEFLATE_MIN_OUTPUT_SIZE))
+			comp_page_nbytes = (*c->impl)(c, in_pages[page].data, in_pages[page].nbytes,
+						      out_pages[page].data, out_pages[page].nbytes);
 
 		out_pages[page].nbytes = comp_page_nbytes;
 
@@ -236,11 +237,21 @@ LIBDEFLATEEXPORT size_t LIBDEFLATEAPI
 libdeflate_gdeflate_compress_bound(struct libdeflate_compressor *c,
 				   size_t in_nbytes, size_t *out_npages)
 {
-	const size_t page_bound = libdeflate_deflate_compress_bound(c, GDEFLATE_PAGE_SIZE);
+	/*
+	 * The worst case of DEFLATE is all uncompressed blocks, each with 5
+	 * bytes of overhead (see libdeflate_deflate_compress_bound(), which is
+	 * built without GDEFLATE, so it cannot be called here).  A GDeflate
+	 * stream writes its bits in packets of BITS_PER_PACKET; besides the
+	 * full ones, each stream ends with the packet it is writing and the one
+	 * it has reserved after it.
+	 */
+	const size_t max_num_blocks = DIV_ROUND_UP(GDEFLATE_PAGE_SIZE, MIN_BLOCK_LENGTH);
+	const size_t page_bound = (5 * max_num_blocks) + GDEFLATE_PAGE_SIZE + 1 +
+		OUTPUT_END_PADDING + 2 * (NUM_STREAMS * BITS_PER_PACKET) / 8;
 	const size_t npages = DIV_ROUND_UP(in_nbytes, GDEFLATE_PAGE_SIZE);
 
 	if (out_npages)
 		*out_npages = npages;
 
-	return (page_bound + (NUM_STREAMS * BITS_PER_PACKET) / 8) * npages;
+	return page_bound * npages;
 }
