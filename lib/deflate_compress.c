@@ -187,9 +187,37 @@ static const u8 deflate_extra_offset_bits[] = {
 #endif
 };
 
-/* Table: length => length slot  */
-static u8 deflate_length_slot[DEFLATE_MAX_MATCH_LEN + 1] = { 0 };
-static u8 deflate_length_slot_inited = 0;
+/* Table: length => length slot, for the lengths below 258.  It is constant so
+ * that compressors in different threads can use it.  */
+static const u8 deflate_length_slot_table[258] = {
+	 0,  0,  0,  0,  1,  2,  3,  4,  5,  6,  7,  8,  8,  9,  9, 10,
+	10, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15,
+	15, 15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17,
+	17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19,
+	19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+	20, 20, 20, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+	21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22,
+	22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+	23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+	24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+	24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
+	25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
+	25, 25, 25, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+	26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+	26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+	27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+	27, 27,
+};
+
+/* Length => length slot.  Length 258 and, in DEFLATE64, every longer length
+ * are in the last slot.  */
+static forceinline unsigned
+deflate_get_length_slot(unsigned length)
+{
+	if (length < ARRAY_LEN(deflate_length_slot_table))
+		return deflate_length_slot_table[length];
+	return ARRAY_LEN(deflate_length_slot_base) - 1;
+}
 
 /* The order in which precode codeword lengths are stored */
 static const u8 deflate_precode_lens_permutation[DEFLATE_NUM_PRECODE_SYMS] = {
@@ -2021,7 +2049,7 @@ gdeflate_write_item_list(struct deflate_output_bitstream *os,
 					 codes->lens.litlen[litlen_symbol]);
 		} else {
 			/* Match length  */
-			length_slot = deflate_length_slot[length];
+			length_slot = deflate_get_length_slot(length);
 			litlen_symbol = 257 + length_slot;
 			deflate_add_bits(os, codes->codewords.litlen[litlen_symbol],
 					 codes->lens.litlen[litlen_symbol]);
@@ -2085,7 +2113,7 @@ deflate_write_item_list(struct deflate_output_bitstream *os,
 			deflate_flush_bits(os);
 		} else {
 			/* Match length  */
-			length_slot = deflate_length_slot[length];
+			length_slot = deflate_get_length_slot(length);
 			litlen_symbol = 257 + length_slot;
 			deflate_add_bits(os, codes->codewords.litlen[litlen_symbol],
 					 codes->lens.litlen[litlen_symbol]);
@@ -2303,7 +2331,7 @@ deflate_choose_match(struct libdeflate_compressor *c,
 		     u32 *litrunlen_p, struct deflate_sequence **next_seq_p)
 {
 	struct deflate_sequence *seq = *next_seq_p;
-	unsigned length_slot = deflate_length_slot[length];
+	unsigned length_slot = deflate_get_length_slot(length);
 	unsigned offset_slot = deflate_get_offset_slot(c, offset);
 
 	c->freqs.litlen[257 + length_slot]++;
@@ -2711,7 +2739,7 @@ deflate_tally_item_list(struct libdeflate_compressor *c, u32 block_length)
 			c->freqs.litlen[offset]++;
 		} else {
 			/* Match  */
-			c->freqs.litlen[257 + deflate_length_slot[length]]++;
+			c->freqs.litlen[257 + deflate_get_length_slot(length)]++;
 			c->freqs.offset[deflate_get_offset_slot(c, offset)]++;
 		}
 		cur_node += length;
@@ -2733,7 +2761,7 @@ deflate_set_costs_from_codes(struct libdeflate_compressor *c,
 
 	/* Lengths  */
 	for (i = DEFLATE_MIN_MATCH_LEN; i <= DEFLATE_MAX_MATCH_LEN; i++) {
-		unsigned length_slot = deflate_length_slot[i];
+		unsigned length_slot = deflate_get_length_slot(i);
 		unsigned litlen_sym = 257 + length_slot;
 		u32 bits = (lens->litlen[litlen_sym] ? lens->litlen[litlen_sym] : LENGTH_NOSTAT_BITS);
 		bits += deflate_extra_length_bits[length_slot];
@@ -2794,7 +2822,7 @@ deflate_set_default_costs(struct libdeflate_compressor *c)
 	/* Lengths  */
 	for (i = DEFLATE_MIN_MATCH_LEN; i <= DEFLATE_MAX_MATCH_LEN; i++)
 		c->p.n.costs.length[i] = deflate_default_length_slot_cost(
-						deflate_length_slot[i]);
+						deflate_get_length_slot(i));
 
 	/* Offset slots  */
 	for (i = 0; i < ARRAY_LEN(deflate_offset_slot_base); i++)
@@ -2830,7 +2858,7 @@ deflate_adjust_costs(struct libdeflate_compressor *c)
 	for (i = DEFLATE_MIN_MATCH_LEN; i <= DEFLATE_MAX_MATCH_LEN; i++)
 		deflate_adjust_cost(&c->p.n.costs.length[i],
 				    deflate_default_length_slot_cost(
-						deflate_length_slot[i]));
+						deflate_get_length_slot(i)));
 
 	/* Offset slots  */
 	for (i = 0; i < ARRAY_LEN(deflate_offset_slot_base); i++)
@@ -3169,38 +3197,6 @@ deflate_init_offset_slot_fast(struct libdeflate_compressor *c)
 	}
 }
 
-/* Initialize deflate_length_slot. */
-static void
-deflate_init_length_slot(void)
-{
-	unsigned length_slot;
-	unsigned length;
-	unsigned length_end;
-
-	if (deflate_length_slot_inited > 0)
-		return;
-
-	for (length_slot = 1;
-		length_slot < ARRAY_LEN(deflate_length_slot_base);
-		length_slot++)
-	{
-		length = deflate_length_slot_base[length_slot];
-		length_end = length + (1 << deflate_extra_length_bits[length_slot]);
-#ifdef DEFLATE64
-		/* the last slot is a special case in deflate64 */
-		if (length_slot == ARRAY_LEN(deflate_length_slot_base) - 1) {
-			length = 258;
-			length_end = DEFLATE_MAX_MATCH_LEN + 1;
-		}
-#endif
-		do {
-			deflate_length_slot[length] = length_slot;
-		} while (++length != length_end);
-	}
-
-	deflate_length_slot_inited = 1;
-}
-
 #ifndef HIDE_INTERFACE
 
 LIBDEFLATEEXPORT struct libdeflate_compressor * LIBDEFLATEAPI
@@ -3320,7 +3316,6 @@ libdeflate_alloc_compressor(int compression_level)
 
 	deflate_init_offset_slot_fast(c);
 	deflate_init_static_codes(c);
-	deflate_init_length_slot();
 
 	return c;
 }
