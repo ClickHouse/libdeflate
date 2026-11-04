@@ -159,6 +159,27 @@ libdeflate_alloc_gdeflate_compressor(int compression_level)
 	return c;
 }
 
+/*
+ * Compress one page.  An empty page is written as a single empty final stored
+ * block, as libdeflate_deflate_compress() does: the compressors read the input
+ * before they compare its position with its end.
+ */
+static size_t
+gdeflate_compress_page(struct libdeflate_compressor *c,
+		       const void *in, size_t in_nbytes,
+		       void *out, size_t out_nbytes_avail)
+{
+	if (unlikely(in_nbytes == 0)) {
+		struct deflate_output_bitstream os;
+
+		deflate_init_output(&os, out, out_nbytes_avail);
+		deflate_write_uncompressed_block(&os, (const u8 *)&os, 0, true);
+		return deflate_flush_output(&os);
+	}
+
+	return (*c->impl)(c, in, in_nbytes, out, out_nbytes_avail);
+}
+
 LIBDEFLATEEXPORT size_t LIBDEFLATEAPI
 libdeflate_gdeflate_compress(struct libdeflate_compressor *c,
 			     const void *in, size_t in_nbytes,
@@ -168,9 +189,15 @@ libdeflate_gdeflate_compress(struct libdeflate_compressor *c,
 	const u8 * in_bytes = in;
 	size_t out_nbytes = 0;
 	size_t npages;
-	size_t upper_bound = libdeflate_gdeflate_compress_bound(c,
-						in_nbytes, &npages);
-	size_t page_upper_bound = upper_bound / npages;
+	size_t upper_bound;
+	size_t page_upper_bound;
+
+	/* No input makes no pages.  */
+	if (unlikely(in_nbytes == 0))
+		return 0;
+
+	upper_bound = libdeflate_gdeflate_compress_bound(c, in_nbytes, &npages);
+	page_upper_bound = upper_bound / npages;
 
 	if (unlikely(out_pages == NULL || out_npages != npages))
 		return 0;
@@ -184,7 +211,7 @@ libdeflate_gdeflate_compress(struct libdeflate_compressor *c,
 			return 0;
 		}
 
-		comp_page_nbytes = (*c->impl)(c, in_bytes, page_nbytes,
+		comp_page_nbytes = gdeflate_compress_page(c, in_bytes, page_nbytes,
 			out_pages[page].data, page_upper_bound);
 
 		out_pages[page].nbytes = comp_page_nbytes;
@@ -214,8 +241,8 @@ libdeflate_gdeflate_compress_ex(struct libdeflate_compressor *c,
 		size_t comp_page_nbytes = 0;
 
 		if (likely(out_pages[page].nbytes >= GDEFLATE_MIN_OUTPUT_SIZE))
-			comp_page_nbytes = (*c->impl)(c, in_pages[page].data, in_pages[page].nbytes,
-						      out_pages[page].data, out_pages[page].nbytes);
+			comp_page_nbytes = gdeflate_compress_page(c, in_pages[page].data, in_pages[page].nbytes,
+							       out_pages[page].data, out_pages[page].nbytes);
 
 		out_pages[page].nbytes = comp_page_nbytes;
 
