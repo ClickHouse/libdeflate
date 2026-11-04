@@ -154,7 +154,6 @@ libdeflate_alloc_gdeflate_compressor(int compression_level)
 
 	deflate_init_offset_slot_fast(c);
 	deflate_init_static_codes(c);
-	deflate_init_length_slot();
 
 	return c;
 }
