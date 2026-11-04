@@ -665,6 +665,9 @@ struct deflate_output_bitstream {
 
 	/* Pointer just past the end of the output buffer.  */
 	u8 *end;
+
+	/* Where the bit packets go once the output buffer is full.  */
+	u8 overflow_packet[BITS_PER_PACKET/8];
 };
 
 /*
@@ -678,8 +681,13 @@ struct deflate_output_bitstream {
  */
 #define OUTPUT_END_PADDING	8
 
+/* The smallest output buffer that holds the bit packet each GDeflate stream
+ * starts with, followed by OUTPUT_END_PADDING.  */
+#define GDEFLATE_MIN_OUTPUT_SIZE \
+	((NUM_STREAMS * BITS_PER_PACKET) / 8 + OUTPUT_END_PADDING)
+
 /* Initialize the output bitstream.  'size' is assumed to be at least
- * OUTPUT_END_PADDING.  */
+ * GDEFLATE_MIN_OUTPUT_SIZE.  */
 static void
 deflate_init_output(struct deflate_output_bitstream *os,
 		    void *buffer, size_t size)
@@ -696,7 +704,7 @@ deflate_init_output(struct deflate_output_bitstream *os,
 		os->next += BITS_PER_PACKET/8;
 
 		/* Clear the output.  */
-		put_unaligned_le32(0, os->write_ptr[os->idx]);
+		put_unaligned_le32(0, os->write_ptr[n]);
 
 		/* The next write position is not known yet.  */
 		os->next_ptr[n] = NULL;
@@ -740,6 +748,17 @@ deflate_add_bits(struct deflate_output_bitstream *os,
 	 * it is time to reserve the next write pointer.  */
 	if (os->input_bitcount[os->idx] < LOW_WATERMARK_BITS &&
 	    os->next_ptr[os->idx] == NULL) {
+		/* No room for the packet: mark the overflow, which
+		 * deflate_flush_output() reports, and send this packet and all
+		 * that follow to the scratch packet instead of past the end of
+		 * the output buffer.  */
+		if (unlikely(os->end - os->next <= BITS_PER_PACKET/8)) {
+			os->next = os->end;
+			os->next_ptr[os->idx] = os->overflow_packet;
+			os->input_bitcount[os->idx] += BITS_PER_PACKET;
+			return;
+		}
+
 		os->next_ptr[os->idx] = os->next;
 		os->next += BITS_PER_PACKET/8;
 

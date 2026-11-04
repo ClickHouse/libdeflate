@@ -60,6 +60,7 @@
 #undef ENSURE_BITS
 #define ENSURE_BITS(n)							\
 if (!HAVE_BITS(n)) {							\
+	SAFETY_CHECK(in_end - in_next >= BITS_PER_PACKET/8);		\
 	s->bitbuf[s->idx] |= (bitbuf_t)(get_unaligned_le32(in_next)) << \
 		s->bitsleft[s->idx];					\
 	in_next += BITS_PER_PACKET/8;					\
